@@ -77,35 +77,6 @@ true_positions[:, 3] = np.random.choice(DIRECTION_CHOICES, size=NUM_VEHICLES)  #
 
 
 
-def compute_reward(delay, energy, alpha=0.5, beta=0.5):
-    cost = alpha * delay + beta * energy
-    reward = 1 / cost if cost > 0 else 0  # Avoid division by zero
-    return reward
-
-
-
-def calculate_transmission_rate( P, d):
-        """
-        Calculate the data transmission rate using the Shannon-Hartley theorem.
-
-        Parameters:
-            P (float): Transmit power (in Watts).
-            d (float): Distance between transmitter and receiver (in meters).
-
-        Returns:
-            float: Data transmission rate (in bits per second).
-        """
-        # Avoid division by zero by ensuring d is not zero
-        d = max(d, 1e-9)
-
-        # Calculate the signal-to-noise ratio (SNR)
-        SNR = (P * (d ** (-self.path_loss_exponent)) * (np.abs(self.channel_fading) ** 2)) / self.noise_power
-
-        # Calculate the transmission rate using the Shannon-Hartley theorem
-        transmission_rate = self.bandwidth * np.log2(1 + SNR)
-
-        return transmission_rate
-
 class MissionVehicle:
     def __init__(self, vehicle_id):
         self.vehicle_id = vehicle_id
@@ -148,7 +119,7 @@ class RoadsideUnit:
         self.rsu_id = rsu_id
         self.x = random.uniform(0, ROAD_LENGTH)  # Random position along the road
         self.y = 0  # Assume RSUs are placed along the road
-        self.cpu = random.uniform(*RSU_CPU_RANGE)  # Random CPU frequency for RSU
+        self.cpu_freq = random.uniform(*RSU_CPU_RANGE)  # Random CPU frequency for RSU
         self.rsu_transmit_power = 0.2 
     def __repr__(self):
         return f"RSU-{self.rsu_id}: Loc({self.x:.2f}, {self.y}), CPU: {self.cpu/1e9:.2f} GHz"
@@ -172,7 +143,7 @@ class DDQNAgent:
             tf.keras.layers.Dense(128, activation='relu'),
             tf.keras.layers.Dense(self.action_dim, activation=None)
         ])
-        model.compile(loss='mse', optimizer=Adam(learning_rate=LEARNING_RATE))
+        model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
         return model
 
     def update_target_network(self, hard=False):
@@ -262,33 +233,20 @@ def run_ddqn_simulation():
 
             action = ddqn.act(state)
 
-
             if action == 0:  # Local processing
-
-                delay = (PROCESSING_COMPLEXITY * mv.task_size ) / mv.cpu
-                energy=  KAPPA * (mv.cpu ** 2) * PROCESSING_COMPLEXITY * mv.task_size
-                reward = compute_reward(delay, energy, alpha=1, beta=0.5)
+                delay = mv.task_cycles / mv.cpu
+                reward = ALPHA * (comp_revenue - delay)
                 ddqn_offloading_counts["Local"] += 1
                 latency_local = delay
                 energy_local = latency_local * POWER_LOCAL
                 global_total_latency_local += latency_local
                 global_total_energy_local += energy_local
                 global_count_local += 1
-
-
             elif action == 1:  # RSU Offloading
-                selected_rsu = min(rsus, key=lambda r: ((mv.x - r.x) ** 2 + (mv.y - r.y) ** 2) ** 0.5)
-                delay_edge=(PROCESSING_COMPLEXITY * mv.task_size ) / selected_rsu.cpu
-                 # Till Here we have completed
-                delay_uplink=ALPHA*(selected_rsu.task_size/)
-                delay_downlink=
-
-                delay = delay_edge + delay_uplink + delay_downlink
-
+                selected_rsu = min(rsus, key=lambda r: abs(mv.x - r.location))
                 delay_comm = transmission_delay(mv.task_size, V2R_BANDWIDTH)
                 delay_comp = mv.task_cycles / selected_rsu.cpu
                 cost = BANDWIDTH_COST_RSU * V2R_BANDWIDTH
-                
                 reward = ALPHA * (comm_revenue - delay_comm) + BETA * (comp_revenue - delay_comp) - cost
                 ddqn_offloading_counts["RSU"] += 1
                 latency_rsu = delay_comm + delay_comp
@@ -323,53 +281,9 @@ def run_ddqn_simulation():
             print(f"DDQN Episode {episode} - Total Reward: {total_reward:.2f}")
     return ddqn, ddqn_episode_rewards
 
-
-
-# Visualization functions (you can reuse the same functions as before)
-def plot_training_rewards(episode_rewards):
-    plt.figure(figsize=(10,6))
-    plt.plot(range(len(episode_rewards)), episode_rewards, marker='o', linestyle='-', label="Training Reward")
-    plt.title("DDQN Training: Reward Over Episodes")
-    plt.xlabel("Episodes")
-    plt.ylabel("Total Reward")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-def plot_offloading_distribution(offloading_counts):
-    labels = list(offloading_counts.keys())
-    sizes = list(offloading_counts.values())
-    plt.figure(figsize=(8,8))
-    plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=['gold', 'lightblue', 'lightgreen'])
-    plt.title("DDQN Offloading Decision Distribution")
-    plt.show()
-
-def plot_latency_distribution():
-    avg_latency_local = global_total_latency_local / global_count_local if global_count_local > 0 else 0
-    avg_latency_rsu = global_total_latency_rsu / global_count_rsu if global_count_rsu > 0 else 0
-    avg_latency_v2v = global_total_latency_v2v / global_count_v2v if global_count_v2v > 0 else 0
-    plt.figure(figsize=(8,6))
-    plt.bar(['Local','RSU','V2V'], [avg_latency_local, avg_latency_rsu, avg_latency_v2v],
-            color=['gold','lightblue','lightgreen'])
-    plt.title("DDQN Average Latency by Offloading Option")
-    plt.ylabel("Latency (s)")
-    plt.show()
-
-def plot_energy_consumption():
-    avg_energy_local = global_total_energy_local / global_count_local if global_count_local > 0 else 0
-    avg_energy_rsu = global_total_energy_rsu / global_count_rsu if global_count_rsu > 0 else 0
-    avg_energy_v2v = global_total_energy_v2v / global_count_v2v if global_count_v2v > 0 else 0
-    plt.figure(figsize=(8,6))
-    plt.bar(['Local','RSU','V2V'], [avg_energy_local, avg_energy_rsu, avg_energy_v2v],
-            color=['gold','lightblue','lightgreen'])
-    plt.title("DDQN Average Energy Consumption by Offloading Option")
-    plt.ylabel("Energy (Joules)")
-    plt.show()
-
-# Run DDQN simulation and plot results
-ddqn_agent, ddqn_episode_rewards = run_ddqn_simulation()
-plot_training_rewards(ddqn_episode_rewards)
-plot_offloading_distribution(ddqn_offloading_counts)
-plot_latency_distribution()
-plot_energy_consumption()
-
+plt.plot(range(EPISODES), rewards_per_episode, color='blue')
+plt.xlabel('Episodes')
+plt.ylabel('Total Reward')
+plt.title('DQN Training Progress')
+plt.grid(True)
+plt.show()
