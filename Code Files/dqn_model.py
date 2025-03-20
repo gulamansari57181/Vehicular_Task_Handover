@@ -9,7 +9,7 @@ from collections import deque
 # Simulation Parameters
 NUM_VEHICLES = 80
 NUM_RSUS = 30
-STATE_SIZE = 8 # Features: CPU freq, transmission rates, distance, task size
+STATE_SIZE = 10# Features: CPU freq, transmission rates, distance, task size
 ACTION_SIZE = 3  # Offloading choices: Local, RSU, Vehicle
 GAMMA = 0.9  # Discount factor
 EPSILON = 0.9  # Initial exploration rate
@@ -37,12 +37,14 @@ ROAD_LENGTH = 10000  # Road length in meters
 VEHICLE_SPEED_RANGE = (30, 120)  # Speed range in km/hr
 COMMUNICATION_RANGE=200 # Communication range in meters
 DIRECTION_CHOICES = [-1, 1]  # -1 for left, 1 for right
+PATH_LOSS_EXPONENT=4
+CHANNEL_FADING=1
 
 
 
 # Constants for calculations
 BANDWIDTH = 10e6  
-NOISE_POWER = 1e-9  
+NOISE_POWER = 1 
 PROCESSING_COMPLEXITY = 1000  
 KAPPA = 1e-27  
 INPUT_DATA_SIZE = 16e6  
@@ -101,12 +103,26 @@ def calculate_transmission_rate( P, d):
         d = max(d, 1e-9)
 
         # Calculate the signal-to-noise ratio (SNR)
-        SNR = (P * (d ** (-self.path_loss_exponent)) * (np.abs(self.channel_fading) ** 2)) / self.noise_power
+        SNR = (P * (d ** (-PATH_LOSS_EXPONENT)) * (np.abs(CHANNEL_FADING) ** 2)) / NOISE_POWER
 
         # Calculate the transmission rate using the Shannon-Hartley theorem
-        transmission_rate = self.bandwidth * np.log2(1 + SNR)
+        transmission_rate = BANDWIDTH* np.log2(1 + SNR)
 
-        return transmission_rate
+        return max(transmission_rate, 1e-6)
+    
+def select_best_vehicle_for_offloading(mv, available_vehicles):
+    """
+    Select the best cooperative vehicle based on CPU power and distance.
+    """
+    if not available_vehicles:
+        return None  # No vehicle available for offloading
+    
+    # Select the vehicle with best CPU power within the shortest distance
+    selected_vehicle = min(
+        available_vehicles, 
+        key=lambda v: ((mv.x - v.x) ** 2 + (mv.y - v.y) ** 2) ** 0.5 / v.cpu
+    )
+    return selected_vehicle
 
 class MissionVehicle:
     def __init__(self, vehicle_id):
@@ -158,7 +174,7 @@ class RoadsideUnit:
     
 # DQN Model
 class DDQNAgent:
-    def __init__(self, input_dim=7, action_dim=3):
+    def __init__(self, input_dim=10, action_dim=3):
         self.input_dim = input_dim
         self.action_dim = action_dim
         self.online_network = self.build_network()
@@ -170,11 +186,12 @@ class DDQNAgent:
 
     def build_network(self):
         model = tf.keras.Sequential([
-            tf.keras.layers.Dense(128, activation='relu', input_shape=(self.input_dim,)),
-            tf.keras.layers.Dense(128, activation='relu'),
-            tf.keras.layers.Dense(self.action_dim, activation=None)
+            layers.Input(shape=(self.input_dim,)),
+            layers.Dense(128, activation='relu'),
+            layers.Dense(128, activation='relu'),
+            layers.Dense(self.action_dim, activation=None)
         ])
-        model.compile(loss='mse', optimizer=Adam(learning_rate=LEARNING_RATE))
+        model.compile(loss='mse', optimizer=Adam(learning_rate=LEARNING_RATE))  
         return model
 
     def update_target_network(self, hard=False):
@@ -252,65 +269,86 @@ def run_ddqn_simulation():
     global global_count_local, global_count_rsu, global_count_v2v
 
     ddqn_episode_rewards = []
-    for episode in range(1000):
+    for episode in range(400):
         total_reward = 0
         for mv in mission_vehicles:
             
             available_rsus = [r for r in rsus if abs(r.x - mv.x) <= COMMUNICATION_RANGE]
             available_vehicles = [v for v in mission_vehicles if v.vehicle_id != mv.vehicle_id and abs(v.x - mv.x) <= COMMUNICATION_RANGE]
 
-            state = [len(available_rsus), len(available_vehicles), mv.x, mv.y, mv.cpu, 
-                 available_rsus[0].cpu if available_rsus else 0, mv.velocity, mv.direction]
+            state = [
+                    len(available_rsus),  # Number of RSUs in range
+                    len(available_vehicles),  # Number of vehicles in range
+                    mv.x, mv.y,  # Location
+                    mv.cpu,  # CPU frequency of vehicle
+                    mv.task_size,  # Remaining task size
+                    available_rsus[0].cpu if available_rsus else 0,  # CPU of selected RSU
+                    available_vehicles[0].cpu if available_vehicles else 0,  # CPU of selected vehicle
+                    mv.velocity,  # Speed of the vehicle
+                    mv.direction  # Moving direction
+                ]
 
             action = ddqn.act(state)
 
 
             if action == 0:  # Local processing
 
-                delay = (PROCESSING_COMPLEXITY * mv.task_size ) / mv.cpu
-                energy=  KAPPA * (mv.cpu ** 2) * PROCESSING_COMPLEXITY * mv.task_size
-                reward = compute_reward(delay, energy, alpha=1, beta=0.5)
+                local_delay = (PROCESSING_COMPLEXITY * mv.task_size ) / mv.cpu
+                local_energy=  KAPPA * (mv.cpu ** 2) * PROCESSING_COMPLEXITY * mv.task_size
+                reward = compute_reward(local_delay, local_energy, alpha=1, beta=0.5)
                 ddqn_offloading_counts["Local"] += 1
-                latency_local = delay
-                energy_local = latency_local * POWER_LOCAL
-                global_total_latency_local += latency_local
-                global_total_energy_local += energy_local
+                global_total_latency_local += local_delay
+                global_total_energy_local += local_energy
                 global_count_local += 1
 
 
             elif action == 1:  # RSU Offloading
                 selected_rsu = min(rsus, key=lambda r: ((mv.x - r.x) ** 2 + (mv.y - r.y) ** 2) ** 0.5)
                 delay_edge=(PROCESSING_COMPLEXITY * mv.task_size ) / selected_rsu.cpu
-                distance=((mv.x - selected_rsu.x) ** 2 + (mv.y - selected_rsu.y) ** 2) ** 0.5
-                delay_uplink=ALPHA*(selected_rsu.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
-                delay_downlink=BETA*(selected_rsu.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
-                delay = delay_edge + delay_uplink + delay_downlink
-                energy=(mv.vehicle_transmit_power*PROCESSING_COMPLEXITY*mv.task_size)/calculate_transmission_rate( mv.vehicle_transmit_power, distance)
-                reward = compute_reward(delay, energy, alpha=1, beta=0.5)
+                distance=np.sqrt((mv.x - selected_rsu.x) ** 2 + (mv.y - selected_rsu.y) ** 2) 
+                delay_uplink=ALPHA*(mv.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
+                delay_downlink=BETA*(mv.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
+               
+                rsu_delay = delay_edge + delay_uplink + delay_downlink
+                rsu_energy=(mv.vehicle_transmit_power*PROCESSING_COMPLEXITY*mv.task_size)/calculate_transmission_rate( mv.vehicle_transmit_power, distance)
+                reward = compute_reward(rsu_delay, rsu_energy, alpha=1, beta=0.5)
                 ddqn_offloading_counts["RSU"] += 1
-                latency_rsu = delay_comm + delay_comp
-                energy_rsu = latency_rsu * POWER_RSU
-                global_total_latency_rsu += latency_rsu
-                global_total_energy_rsu += energy_rsu
+                
+                global_total_latency_rsu += rsu_delay
+                global_total_energy_rsu += rsu_energy
                 global_count_rsu += 1
             else:  # V2V Offloading
                 # Till Here we have completed
                 
-                selected_cv = select_cooperative_vehicle(mv, cooperative_vehicles, model_lat, model_lon)
-                if selected_cv is None:
-                    latency = mv.task_cycles / mv.cpu
-                    energy = latency * POWER_LOCAL
+                selected_vehicle = select_best_vehicle_for_offloading(mv, available_vehicles)
+                if selected_vehicle is None:
+                    local_delay = (PROCESSING_COMPLEXITY * mv.task_size ) / mv.cpu
+                    local_energy=  KAPPA * (mv.cpu ** 2) * PROCESSING_COMPLEXITY * mv.task_size
+                    reward = compute_reward(local_delay, local_energy, alpha=1, beta=0.5)
+                    ddqn_offloading_counts["Local"] += 1
+                    global_total_latency_local += local_delay
+                    global_total_energy_local += local_energy
+                    global_count_local += 1
+                    
                 else:
-                    delay_comm = transmission_delay(mv.task_size, V2V_BANDWIDTH)
-                    delay_comp = mv.task_cycles / selected_cv.cpu
-                    cost = BANDWIDTH_COST_V2V * V2V_BANDWIDTH
-                    reward = ALPHA * (comm_revenue - delay_comm) + BETA * (comp_revenue - delay_comp) - cost
+                    distance = np.sqrt((mv.x - selected_vehicle.x) ** 2 + (mv.y - selected_vehicle.y) ** 2)
+                    transmission_rate = calculate_transmission_rate(mv.vehicle_transmit_power, distance)
+                    
+                    delay_uplink = ALPHA*(mv.task_size / transmission_rate)
+                    delay_execution = (PROCESSING_COMPLEXITY * mv.task_size) / selected_vehicle.cpu
+                    delay_downlink = BETA*(mv.task_size / transmission_rate)
+                    total_v2v_delay = delay_uplink + delay_execution + delay_downlink
+                    total_v2v_energy = (mv.vehicle_transmit_power * PROCESSING_COMPLEXITY * mv.task_size) / transmission_rate
+
+                    # Compute Reward
+                    reward = compute_reward(total_v2v_delay, total_v2v_energy)
+
+                    # Update global tracking variables
                     ddqn_offloading_counts["V2V"] += 1
-                    latency_v2v = delay_comm + delay_comp
-                    energy_v2v = latency_v2v * POWER_V2V
-                    global_total_latency_v2v += latency_v2v
-                    global_total_energy_v2v += energy_v2v
-                    global_count_v2v += 1
+                    global_total_latency_v2v += total_v2v_delay
+                    global_total_energy_v2v += total_v2v_energy
+                    global_count_v2v += 1   
+                    
             total_reward += reward
             next_state = state
             ddqn.store_experience(state, action, reward, next_state, done=False)
@@ -355,6 +393,7 @@ def plot_latency_distribution():
     plt.show()
 
 def plot_energy_consumption():
+    print(f"Global Local Count{global_count_local}")
     avg_energy_local = global_total_energy_local / global_count_local if global_count_local > 0 else 0
     avg_energy_rsu = global_total_energy_rsu / global_count_rsu if global_count_rsu > 0 else 0
     avg_energy_v2v = global_total_energy_v2v / global_count_v2v if global_count_v2v > 0 else 0
