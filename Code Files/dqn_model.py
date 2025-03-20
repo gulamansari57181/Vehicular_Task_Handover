@@ -77,6 +77,8 @@ true_positions[:, 3] = np.random.choice(DIRECTION_CHOICES, size=NUM_VEHICLES)  #
 
 
 
+# Utilit Methods 
+
 def compute_reward(delay, energy, alpha=0.5, beta=0.5):
     cost = alpha * delay + beta * energy
     reward = 1 / cost if cost > 0 else 0  # Avoid division by zero
@@ -279,17 +281,12 @@ def run_ddqn_simulation():
             elif action == 1:  # RSU Offloading
                 selected_rsu = min(rsus, key=lambda r: ((mv.x - r.x) ** 2 + (mv.y - r.y) ** 2) ** 0.5)
                 delay_edge=(PROCESSING_COMPLEXITY * mv.task_size ) / selected_rsu.cpu
-                 # Till Here we have completed
-                delay_uplink=ALPHA*(selected_rsu.task_size/)
-                delay_downlink=
-
+                distance=((mv.x - selected_rsu.x) ** 2 + (mv.y - selected_rsu.y) ** 2) ** 0.5
+                delay_uplink=ALPHA*(selected_rsu.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
+                delay_downlink=BETA*(selected_rsu.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
                 delay = delay_edge + delay_uplink + delay_downlink
-
-                delay_comm = transmission_delay(mv.task_size, V2R_BANDWIDTH)
-                delay_comp = mv.task_cycles / selected_rsu.cpu
-                cost = BANDWIDTH_COST_RSU * V2R_BANDWIDTH
-                
-                reward = ALPHA * (comm_revenue - delay_comm) + BETA * (comp_revenue - delay_comp) - cost
+                energy=(mv.vehicle_transmit_power*PROCESSING_COMPLEXITY*mv.task_size)/calculate_transmission_rate( mv.vehicle_transmit_power, distance)
+                reward = compute_reward(delay, energy, alpha=1, beta=0.5)
                 ddqn_offloading_counts["RSU"] += 1
                 latency_rsu = delay_comm + delay_comp
                 energy_rsu = latency_rsu * POWER_RSU
@@ -297,6 +294,8 @@ def run_ddqn_simulation():
                 global_total_energy_rsu += energy_rsu
                 global_count_rsu += 1
             else:  # V2V Offloading
+                # Till Here we have completed
+                
                 selected_cv = select_cooperative_vehicle(mv, cooperative_vehicles, model_lat, model_lon)
                 if selected_cv is None:
                     latency = mv.task_cycles / mv.cpu
