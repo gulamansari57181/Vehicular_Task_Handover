@@ -5,14 +5,16 @@ from tensorflow.keras.optimizers import Adam
 import random
 import matplotlib.pyplot as plt
 from collections import deque
+import seaborn as sns
+
 
 # Simulation Parameters
 NUM_VEHICLES = 80
 NUM_RSUS = 30
-STATE_SIZE = 10# Features: CPU freq, transmission rates, distance, task size
-ACTION_SIZE = 3  # Offloading choices: Local, RSU, Vehicle
-GAMMA = 0.9  # Discount factor
-EPSILON = 0.9  # Initial exploration rate
+STATE_SIZE = 10
+ACTION_SIZE = 3  
+GAMMA = 0.9  
+EPSILON = 0.9  
 EPSILON_DECAY = 0.995
 EPSILON_MIN = 0.1
 BATCH_SIZE = 32
@@ -23,17 +25,19 @@ EPISODES = 200
 ALPHA=1
 BETA = 0.5  
 COMMUNICATION_RANGE = 200  
-ROAD_LENGTH = 1000  
+ROAD_LENGTH = 10000  
 VEHICLE_SPEED_RANGE = (30, 120)  
 DIRECTION_CHOICES = [-1, 1]  
-EPISODES=500
+
+
+EPISODES=1000
 
 
 # Constants for initialization
 VEHICLE_CPU_RANGE = (2e9, 8e9)  # CPU frequency range in Hz (2GHz to 8GHz)
 RSU_CPU_RANGE = (8e9, 16e9)  # CPU frequency range in Hz (8GHz to 16GHz)
-TASK_SIZE_RANGE = (5, 50)  # Task size in MB
-CPU_CYCLES_PER_MB = 1000  # Required CPU cycles per MB
+TASK_SIZE_RANGE = (5e6, 16e6)  # Task size in Mbits
+CPU_CYCLES_PER_MB = 1000  # Required CPU cycles per Mbits
 ROAD_LENGTH = 10000  # Road length in meters
 VEHICLE_SPEED_RANGE = (30, 120)  # Speed range in km/hr
 COMMUNICATION_RANGE=200 # Communication range in meters
@@ -68,6 +72,9 @@ global_count_local = 0
 global_count_rsu = 0
 global_count_v2v = 0
 episode_rewards = []
+training_losses = []  # Stores loss values
+q_value_history = []  # Stores Q-values to monitor learning
+
 
 
 # Offloading counts dictionary for DDQN simulation
@@ -82,9 +89,16 @@ true_positions[:, 3] = np.random.choice(DIRECTION_CHOICES, size=NUM_VEHICLES)  #
 
 # Utilit Methods 
 
-def compute_reward(delay, energy, alpha=0.5, beta=0.5):
+def compute_reward(delay, energy, task_complexity):
+    """
+    Computes a dynamic reward function with adaptive weights based on task complexity.
+    """
+    alpha = 1 / (1 + np.exp(-task_complexity))  # Adaptive delay weight (Sigmoid scaling)
+    beta = 1 - alpha  # Adaptive energy weight (Ensures sum is 1)
+    
     cost = alpha * delay + beta * energy
     reward = 1 / cost if cost > 0 else 0  # Avoid division by zero
+    
     return reward
 
 
@@ -140,7 +154,8 @@ def calculate_local_energy(f_loc,task_size):
 
 
 
-    
+
+
 def select_best_vehicle_for_offloading(mv, available_vehicles):
     """
     Select the best cooperative vehicle based on CPU power and distance.
@@ -155,6 +170,8 @@ def select_best_vehicle_for_offloading(mv, available_vehicles):
     )
     return selected_vehicle
 
+
+
 class MissionVehicle:
     def __init__(self, vehicle_id):
         self.vehicle_id = vehicle_id
@@ -163,6 +180,8 @@ class MissionVehicle:
         self.direction = true_positions[vehicle_id, 3]  # Moving direction (-1 or 1)
         self.cpu = random.uniform(*VEHICLE_CPU_RANGE)  # Random CPU frequency
         self.task_size = random.uniform(*TASK_SIZE_RANGE)  # Task size in MB
+        self.task_deadline=random.uniform(0.5,8)  
+        self.remaining_task_size = self.task_size
         self.task_cycles = self.task_size * CPU_CYCLES_PER_MB  # Total CPU cycles required
         self.vehicle_transmit_power = 0.1  # Transmit power of vehicles in Watts
 
@@ -242,12 +261,17 @@ class DDQNAgent:
             dones.append(d)
         states = np.array(states)
         next_states = np.array(next_states)
+        
+        
         # Compute Q-values from online network for next_states to select best action
         next_q_online = self.online_network(next_states)
         best_actions = np.argmax(next_q_online.numpy(), axis=1)
         # Evaluate Q-values of best actions using target network
         next_q_target = self.target_network(next_states).numpy()
         target_q = []
+        q_values_per_episode = []  # Store max Q-values per episode
+        executed_task_mbits_per_episode = []  # Store executed task in Mbits per episode
+        
         for i in range(len(batch)):
             if dones[i]:
                 target_q.append(rewards[i])
@@ -259,10 +283,16 @@ class DDQNAgent:
             q_values = self.online_network(states)
             q_action = tf.reduce_sum(q_values * tf.one_hot(actions, self.action_dim), axis=1)
             loss = tf.reduce_mean(tf.square(target_q - q_action))
+       
+       
         grads = tape.gradient(loss, self.online_network.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.online_network.trainable_variables))
-        # Soft update target network
+          # Soft update target network
         self.update_target_network()
+        
+        # Store Loss and Max Q-Value
+        training_losses.append(loss.numpy())
+        q_value_history.append(np.max(next_q_online.numpy()))
 
 
 
@@ -309,7 +339,8 @@ def run_ddqn_simulation():
                 local_energy= calculate_local_energy(mv.cpu,mv.task_size)
                 
                 
-                reward = compute_reward(local_delay, local_energy, alpha=1, beta=0.5)
+                
+                reward = compute_reward(local_delay, local_energy,mv.task_cycles)
                 ddqn_offloading_counts["Local"] += 1
                 global_total_latency_local += local_delay
                 global_total_energy_local += local_energy
@@ -321,24 +352,24 @@ def run_ddqn_simulation():
                 delay_edge=(PROCESSING_COMPLEXITY * mv.task_size ) / selected_rsu.cpu
                 distance=np.sqrt((mv.x - selected_rsu.x) ** 2 + (mv.y - selected_rsu.y) ** 2) 
                 delay_uplink=ALPHA*(mv.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
-                delay_downlink=BETA*(mv.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
+                delay_downlink=BETA*(mv.task_size/calculate_transmission_rate( selected_rsu.rsu_transmit_power, distance))
                
                 rsu_delay = delay_edge + delay_uplink + delay_downlink
                 rsu_energy=(mv.vehicle_transmit_power*PROCESSING_COMPLEXITY*mv.task_size)/calculate_transmission_rate( mv.vehicle_transmit_power, distance)
-                reward = compute_reward(rsu_delay, rsu_energy, alpha=1, beta=0.5)
+                reward = compute_reward(rsu_delay, rsu_energy,mv.task_cycles)
                 ddqn_offloading_counts["RSU"] += 1
                 
                 global_total_latency_rsu += rsu_delay
                 global_total_energy_rsu += rsu_energy
                 global_count_rsu += 1
             elif action==2 and available_vehicles :  # V2V Offloading
-                # Till Here we have completed
+                
                 
                 selected_vehicle = select_best_vehicle_for_offloading(mv, available_vehicles)
                 if selected_vehicle is None:
                     local_delay = calculate_local_delay(mv.cpu,mv.task_size)
                     local_energy= calculate_local_energy(mv.cpu,mv.task_size)
-                    reward = compute_reward(local_delay, local_energy, alpha=1, beta=0.5)
+                    reward = compute_reward(local_delay, local_energy,mv.task_cycles)
                     ddqn_offloading_counts["Local"] += 1
                     global_total_latency_local += local_delay
                     global_total_energy_local += local_energy
@@ -346,16 +377,14 @@ def run_ddqn_simulation():
                     
                 else:
                     distance = np.sqrt((mv.x - selected_vehicle.x) ** 2 + (mv.y - selected_vehicle.y) ** 2)
-                    transmission_rate = calculate_transmission_rate(mv.vehicle_transmit_power, distance)
-                    
-                    delay_uplink = ALPHA*(mv.task_size / transmission_rate)
+                    delay_uplink = ALPHA*(mv.task_size / calculate_transmission_rate(mv.vehicle_transmit_power, distance))
                     delay_execution = (PROCESSING_COMPLEXITY * mv.task_size) / selected_vehicle.cpu
-                    delay_downlink = BETA*(mv.task_size / transmission_rate)
+                    delay_downlink = BETA*(mv.task_size / calculate_transmission_rate(selected_vehicle.vehicle_transmit_power, distance))
                     total_v2v_delay = delay_uplink + delay_execution + delay_downlink
-                    total_v2v_energy = (mv.vehicle_transmit_power * PROCESSING_COMPLEXITY * mv.task_size) / transmission_rate
+                    total_v2v_energy = (mv.vehicle_transmit_power * PROCESSING_COMPLEXITY * mv.task_size) /calculate_transmission_rate(mv.vehicle_transmit_power, distance)
 
                     # Compute Reward
-                    reward = compute_reward(total_v2v_delay, total_v2v_energy)
+                    reward = compute_reward(total_v2v_delay, total_v2v_energy,mv.task_cycles)
 
                     # Update global tracking variables
                     ddqn_offloading_counts["V2V"] += 1
@@ -367,7 +396,7 @@ def run_ddqn_simulation():
                 local_energy= calculate_local_energy(mv.cpu,mv.task_size)
                 
                 
-                reward = compute_reward(local_delay, local_energy, alpha=1, beta=0.5)
+                reward = compute_reward(local_delay, local_energy,mv.task_cycles)
                 ddqn_offloading_counts["Local"] += 1
                 global_total_latency_local += local_delay
                 global_total_energy_local += local_energy
@@ -386,52 +415,89 @@ def run_ddqn_simulation():
 
 
 
-# Visualization functions (you can reuse the same functions as before)
+
+# Set a unified theme for all plots
+sns.set_style("whitegrid")
+colors = ['#FFD700', '#87CEFA', '#32CD32']  # Gold, Light Blue, Light Green
+
 def plot_training_rewards(episode_rewards):
-    plt.figure(figsize=(10,6))
-    plt.plot(range(len(episode_rewards)), episode_rewards, marker='o', linestyle='-', label="Training Reward")
-    plt.title("DDQN Training: Reward Over Episodes")
-    plt.xlabel("Episodes")
-    plt.ylabel("Total Reward")
-    plt.legend()
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(len(episode_rewards)), episode_rewards, marker='o', linestyle='-', color='dodgerblue', linewidth=2)
+    plt.title("DDQN Training: Reward Over Episodes", fontsize=14, fontweight='bold')
+    plt.xlabel("Episodes", fontsize=12)
+    plt.ylabel("Total Reward", fontsize=12)
     plt.grid(True)
     plt.show()
 
 def plot_offloading_distribution(offloading_counts):
     labels = list(offloading_counts.keys())
     sizes = list(offloading_counts.values())
-    plt.figure(figsize=(8,8))
-    plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=['gold', 'lightblue', 'lightgreen'])
-    plt.title("DDQN Offloading Decision Distribution")
+    plt.figure(figsize=(8, 8))
+    plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=colors, textprops={'fontsize': 12})
+    plt.title("DDQN Offloading Decision Distribution", fontsize=14, fontweight='bold')
     plt.show()
 
 def plot_latency_distribution():
     avg_latency_local = global_total_latency_local / global_count_local if global_count_local > 0 else 0
     avg_latency_rsu = global_total_latency_rsu / global_count_rsu if global_count_rsu > 0 else 0
     avg_latency_v2v = global_total_latency_v2v / global_count_v2v if global_count_v2v > 0 else 0
-    plt.figure(figsize=(8,6))
-    plt.bar(['Local','RSU','V2V'], [avg_latency_local, avg_latency_rsu, avg_latency_v2v],
-            color=['gold','lightblue','lightgreen'])
-    plt.title("DDQN Average Latency by Offloading Option")
-    plt.ylabel("Latency (s)")
+    
+    plt.figure(figsize=(8, 6))
+    plt.bar(['Local', 'RSU', 'V2V'], [avg_latency_local, avg_latency_rsu, avg_latency_v2v], color=colors)
+    plt.title("DDQN Average Latency by Offloading Option", fontsize=14, fontweight='bold')
+    plt.ylabel("Latency (s)", fontsize=12)
+    
+    if global_count_local + global_count_rsu + global_count_v2v == 0:
+        plt.text(1, 0, "No Data Available", ha='center', fontsize=12, color='red')
+    
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.show()
 
 def plot_energy_consumption():
-    print(f"Global Local Count{global_count_local}")
     avg_energy_local = global_total_energy_local / global_count_local if global_count_local > 0 else 0
     avg_energy_rsu = global_total_energy_rsu / global_count_rsu if global_count_rsu > 0 else 0
     avg_energy_v2v = global_total_energy_v2v / global_count_v2v if global_count_v2v > 0 else 0
-    plt.figure(figsize=(8,6))
-    plt.bar(['Local','RSU','V2V'], [avg_energy_local, avg_energy_rsu, avg_energy_v2v],
-            color=['gold','lightblue','lightgreen'])
-    plt.title("DDQN Average Energy Consumption by Offloading Option")
-    plt.ylabel("Energy (Joules)")
+    
+    plt.figure(figsize=(8, 6))
+    plt.bar(['Local', 'RSU', 'V2V'], [avg_energy_local, avg_energy_rsu, avg_energy_v2v], color=colors)
+    plt.title("DDQN Average Energy Consumption by Offloading Option", fontsize=14, fontweight='bold')
+    plt.ylabel("Energy (Joules)", fontsize=12)
+    
+    if global_count_local + global_count_rsu + global_count_v2v == 0:
+        plt.text(1, 0, "No Data Available", ha='center', fontsize=12, color='red')
+    
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.show()
+
+def plot_loss_curve():
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(len(training_losses)), training_losses, marker='o', linestyle='-', color='crimson', linewidth=2)
+    plt.title("DDQN Training Loss Over Episodes", fontsize=14, fontweight='bold')
+    plt.xlabel("Episodes", fontsize=12)
+    plt.ylabel("Loss", fontsize=12)
+    plt.grid(True)
+    plt.show()
+
+def plot_q_value_evolution():
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(len(q_value_history)), q_value_history, marker='o', linestyle='-', color='seagreen', linewidth=2)
+    plt.title("DDQN Q-Value Evolution Over Episodes", fontsize=14, fontweight='bold')
+    plt.xlabel("Episodes", fontsize=12)
+    plt.ylabel("Max Q-Value", fontsize=12)
+    plt.grid(True)
     plt.show()
 
 # Run DDQN simulation and plot results
 ddqn_agent, ddqn_episode_rewards = run_ddqn_simulation()
+
+print(f"Local Offloads: {global_count_local}")
+print(f"RSU Offloads: {global_count_rsu}")
+print(f"V2V Offloads: {global_count_v2v}")
+
 plot_training_rewards(ddqn_episode_rewards)
 plot_offloading_distribution(ddqn_offloading_counts)
 plot_latency_distribution()
 plot_energy_consumption()
+# plot_loss_curve()
+# plot_q_value_evolution()
 
