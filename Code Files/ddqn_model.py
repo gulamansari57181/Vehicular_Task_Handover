@@ -4,9 +4,11 @@ from tensorflow.keras import layers
 from tensorflow.keras.optimizers import Adam
 import random
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 from collections import deque
 import seaborn as sns
-
+import pandas as pd
+import os
 
 # Simulation Parameters
 NUM_VEHICLES = 80
@@ -30,7 +32,7 @@ VEHICLE_SPEED_RANGE = (30, 120)
 DIRECTION_CHOICES = [-1, 1]  
 
 
-EPISODES=600
+EPISODES=200
 
 
 # Constants for initialization
@@ -242,17 +244,17 @@ def calculate_v2v_offload(mv, vehicle, task_size):
 class MissionVehicle:
     def __init__(self, vehicle_id):
         self.vehicle_id = vehicle_id
-        self.x, self.y = true_positions[vehicle_id, :2]  # Location (x, y)
-        self.velocity = true_positions[vehicle_id, 2]  # Speed
-        self.direction = true_positions[vehicle_id, 3]  # Moving direction (-1 or 1)
-        self.cpu = random.uniform(*VEHICLE_CPU_RANGE)  # Random CPU frequency
-        self.task_size = random.uniform(*TASK_SIZE_RANGE)  # Task size in MB
-        self.remaining_task_size = self.task_size
-        self.task_cycles = self.task_size * CPU_CYCLES_PER_MB  # Total CPU cycles required
-        self.vehicle_transmit_power = 0.1  # Transmit power of vehicles in Watts
-        self.remaining_task_size = self.task_size  # NEW: Track remaining task
-        self.task_cycles = self.task_size * CPU_CYCLES_PER_MB
-        self.vehicle_transmit_power = 0.1
+          
+      # Initialize with None/default values (will be set from our dataset)
+        self.x = None
+        self.y = None
+        self.velocity = None
+        self.direction = None
+        self.cpu = None
+        self.task_size = None
+        self.remaining_task_size = None
+        self.task_cycles = None
+        self.vehicle_transmit_power = 0.1  # Default value
     
     #Split task into local and offloaded portions
     def split_task(self, ratio):
@@ -276,6 +278,29 @@ class RoadsideUnit:
         self.rsu_transmit_power = 0.2 
     def __repr__(self):
         return f"RSU-{self.rsu_id}: Loc({self.x:.2f}, {self.y}), CPU: {self.cpu/1e9:.2f} GHz"
+
+
+# === Replace Vehicle/RSU Initialization === #
+def load_initial_conditions(folder="simulation_data"):
+    # Load vehicles
+    df_v = pd.read_csv(f"{folder}/vehicles.csv")
+    vehicles = []
+    for _, row in df_v.iterrows():
+        mv = MissionVehicle(row["id"])
+        mv.x, mv.y = row["x"], row["y"]
+        mv.cpu, mv.task_size = row["cpu"], row["task_size"]
+        mv.remaining_task_size = mv.task_size  # Reset task
+        mv.velocity, mv.direction = row["velocity"], row["direction"]
+        mv.vehicle_transmit_power = row["transmit_power"]
+        vehicles.append(mv)
+    # Load RSUs
+    df_r = pd.read_csv(f"{folder}/rsus.csv")
+    rsus = [RoadsideUnit(row["id"]) for _, row in df_r.iterrows()]
+    for r, row in zip(rsus, df_r.iterrows()):
+        r.x, r.y, r.cpu = row["x"], row["y"], row["cpu"]
+        r.rsu_transmit_power = row["transmit_power"]
+    return vehicles, rsus
+
 
     
 # DQN Model
@@ -370,10 +395,55 @@ class DDQNAgent:
         q_value_history.append(np.max(next_q_online.numpy()))
 
 
+# To load Simulation Data from our dataset
+def load_initial_conditions(folder="simulation_data"):
+    # Load vehicles
+    df_v = pd.read_csv(f"{folder}/vehicles.csv")
+    vehicles = []
+    for _, row in df_v.iterrows():
+        mv = MissionVehicle(row["id"])
+        # Set all attributes from CSV
+        mv.x = float(row["x"])
+        mv.y = float(row["y"])
+        mv.velocity = float(row["velocity"])
+        mv.direction = int(row["direction"])
+        mv.cpu = float(row["cpu"])
+        mv.task_size = float(row["task_size"])
+        mv.remaining_task_size = float(row["task_size"])  # Reset task
+        mv.vehicle_transmit_power = float(row["transmit_power"])
+        mv.task_cycles = mv.task_size * CPU_CYCLES_PER_MB  # Recalculate
+        vehicles.append(mv)
+    
+    # Load RSUs
+    df_r = pd.read_csv(f"{folder}/rsus.csv")
+    rsus = []
+    for _, row in df_r.iterrows():
+        rsu = RoadsideUnit(row["id"])
+        rsu.x = float(row["x"])
+        rsu.y = float(row["y"])
+        rsu.cpu = float(row["cpu"])
+        rsu.rsu_transmit_power = float(row["transmit_power"])
+        rsus.append(rsu)
+    
+    return vehicles, rsus
 
-# Initialize Vehicles and RSUs
-mission_vehicles = [MissionVehicle(i) for i in range(NUM_VEHICLES)]
-rsus = [RoadsideUnit(i) for i in range(NUM_RSUS)]
+# Loading the simulation data from our dataset
+mission_vehicles, rsus = load_initial_conditions()  
+
+
+def load_dqn_model(agent, folder="saved_models", filename="ddqn.weights.h5"):
+    try:
+        agent.online_network.load_weights(f"{folder}/{filename}")
+        agent.target_network.load_weights(f"{folder}/{filename}")
+        print("Loaded pretrained model successfully")
+    except:
+        print("No pretrained model found - starting fresh")
+# To save weights of ddqn model
+def save_dqn_model(agent, folder="saved_models"):
+        os.makedirs(folder, exist_ok=True)
+        agent.online_network.save_weights(f"{folder}/ddqn.weights.h5")
+        print(f"Model saved to {folder}/ddqn.weights.h5")
+
 
 # Initialize Simulation and DQN Agent
 ddqn= DDQNAgent(STATE_SIZE, ACTION_SIZE)
@@ -581,8 +651,30 @@ def run_ddqn_simulation():
 
         if episode % 50 == 0:
             print(f"Episode {episode}: Reward = {total_reward:.2f}")
-
+            
+       
     return ddqn, ddqn_episode_rewards
+
+ddqn, rewards = run_ddqn_simulation()
+save_dqn_model(ddqn)  # Overwrites with new weights
+
+
+def save_initial_conditions(vehicles, rsus, folder="simulation_data"):
+    os.makedirs(folder, exist_ok=True)
+    # Save vehicles
+    pd.DataFrame([{
+        "id": v.vehicle_id, "x": v.x, "y": v.y, "cpu": v.cpu,
+        "task_size": v.task_size, "velocity": v.velocity,
+        "direction": v.direction, "transmit_power": v.vehicle_transmit_power
+    } for v in vehicles]).to_csv(f"{folder}/vehicles.csv", index=False)
+    # Save RSUs
+    pd.DataFrame([{
+        "id": r.rsu_id, "x": r.x, "y": r.y, "cpu": r.cpu,
+        "transmit_power": r.rsu_transmit_power
+    } for r in rsus]).to_csv(f"{folder}/rsus.csv", index=False)
+    print(f"Initial conditions saved to {folder}/")
+
+
 
 
 # Plotting Logic
@@ -754,11 +846,18 @@ def plot_partial_offloading_analysis():
 # Run simulation and plot results
 ddqn_agent, ddqn_episode_rewards = run_ddqn_simulation()
 
+save_dqn_model(ddqn) 
+
+
+# Save initial states (call after initialization)
+save_initial_conditions(mission_vehicles, rsus)
+
 # Print effective counts (accounting for partial offloads)
 print("\n=== Effective Task Distribution ===")
 print(f"Local: {global_count_local + ddqn_offloading_counts.get('Local+RSU',0)*0.5 + ddqn_offloading_counts.get('Local+V2V',0)*0.5 + ddqn_offloading_counts.get('All',0)*0.33:.1f} tasks")
 print(f"RSU: {global_count_rsu + ddqn_offloading_counts.get('Local+RSU',0)*0.5 + ddqn_offloading_counts.get('RSU+V2V',0)*0.5 + ddqn_offloading_counts.get('All',0)*0.33:.1f} tasks")
 print(f"V2V: {global_count_v2v + ddqn_offloading_counts.get('Local+V2V',0)*0.5 + ddqn_offloading_counts.get('RSU+V2V',0)*0.5 + ddqn_offloading_counts.get('All',0)*0.33:.1f} tasks")
+
 
 # Generate all plots
 plot_training_rewards(ddqn_episode_rewards)

@@ -11,7 +11,7 @@ import seaborn as sns
 # Simulation Parameters
 NUM_VEHICLES = 80
 NUM_RSUS = 30
-STATE_SIZE = 10
+STATE_SIZE = 11
 ACTION_SIZE = 3  
 GAMMA = 0.9  
 EPSILON = 0.9  
@@ -21,7 +21,7 @@ BATCH_SIZE = 32
 LEARNING_RATE = 0.05
 TAU = 0.01 
 MEMORY_SIZE = 1024
-EPISODES = 200
+EPISODES = 300
 ALPHA=1
 BETA = 0.5  
 COMMUNICATION_RANGE = 200  
@@ -30,14 +30,14 @@ VEHICLE_SPEED_RANGE = (30, 120)
 DIRECTION_CHOICES = [-1, 1]  
 
 
-EPISODES=1000
+EPISODES=600
 
 
 # Constants for initialization
 VEHICLE_CPU_RANGE = (2e9, 8e9)  # CPU frequency range in Hz (2GHz to 8GHz)
 RSU_CPU_RANGE = (8e9, 16e9)  # CPU frequency range in Hz (8GHz to 16GHz)
 TASK_SIZE_RANGE = (5e6, 16e6)  # Task size in Mbits
-CPU_CYCLES_PER_MB = 1000  # Required CPU cycles per Mbits
+CPU_CYCLES_PER_MB = 1000*10e6  # Required CPU cycles per Mbits
 ROAD_LENGTH = 10000  # Road length in meters
 VEHICLE_SPEED_RANGE = (30, 120)  # Speed range in km/hr
 COMMUNICATION_RANGE=200 # Communication range in meters
@@ -78,7 +78,20 @@ q_value_history = []  # Stores Q-values to monitor learning
 
 
 # Offloading counts dictionary for DDQN simulation
-ddqn_offloading_counts = {"Local": 0, "RSU": 0, "V2V": 0}
+ddqn_offloading_counts = {"Local": 0, "RSU": 0, "V2V": 0,"Local+RSU":0,"Local+V2V":0,"RSU+V2V":0,"All":0}
+
+# ================== Parameters for Partial Offloading ==================
+PARTIAL_OFFLOAD_RATIOS = [0.2, 0.5, 0.8]  # Allowed splitting ratios (20%, 50%, 80%)
+ACTION_SIZE = 7  # Local, RSU, V2V, Local+RSU, Local+V2V, RSU+V2V, All
+ACTION_MEANINGS = {
+    0: "Local",
+    1: "RSU", 
+    2: "V2V",
+    3: "Local+RSU",
+    4: "Local+V2V",
+    5: "RSU+V2V",
+    6: "All"
+}
 
 # Randomly generate vehicle positions (x, y), velocity, and direction
 true_positions = np.random.uniform(0, ROAD_LENGTH, size=(NUM_VEHICLES, 4))
@@ -170,6 +183,60 @@ def select_best_vehicle_for_offloading(mv, available_vehicles):
     )
     return selected_vehicle
 
+# ================== NEW: Offloading Calculation Helpers ==================
+def calculate_rsu_offload(mv, rsu, task_size):
+    """
+    Calculates delay and energy for RSU offloading .
+    Args:
+        mv: MissionVehicle object
+        rsu: Selected RoadsideUnit object
+        task_size: Size of task portion being offloaded (in MB)
+    Returns:
+        (total_delay, total_energy)
+    """
+    # Distance calculation
+    distance = np.sqrt((mv.x - rsu.x)**2 + (mv.y - rsu.y)**2)
+    
+    # Transmission rates 
+    uplink_rate = calculate_transmission_rate(mv.vehicle_transmit_power, distance)
+    downlink_rate = calculate_transmission_rate(rsu.rsu_transmit_power, distance)
+    
+    # Delays 
+    delay_uplink = ALPHA * (task_size / uplink_rate)
+    delay_edge = (PROCESSING_COMPLEXITY * task_size) / rsu.cpu
+    delay_downlink = BETA * (task_size / downlink_rate)
+    
+    # Energy
+    energy = (mv.vehicle_transmit_power * PROCESSING_COMPLEXITY * task_size) / uplink_rate
+    
+    return (delay_edge + delay_uplink + delay_downlink, energy)
+
+def calculate_v2v_offload(mv, vehicle, task_size):
+    """
+    Calculates delay and energy for V2V offloading .
+    Args:
+        mv: MissionVehicle object
+        vehicle: Selected neighboring vehicle
+        task_size: Size of task portion being offloaded (in MB)
+    Returns:
+        (total_delay, total_energy)
+    """
+    # Distance calculation
+    distance = np.sqrt((mv.x - vehicle.x)**2 + (mv.y - vehicle.y)**2)
+    
+    # Transmission rates
+    uplink_rate = calculate_transmission_rate(mv.vehicle_transmit_power, distance)
+    downlink_rate = calculate_transmission_rate(vehicle.vehicle_transmit_power, distance)
+    
+    # Delays (with ALPHA/BETA weights)
+    delay_uplink = ALPHA * (task_size / uplink_rate)
+    delay_execution = (PROCESSING_COMPLEXITY * task_size) / vehicle.cpu
+    delay_downlink = BETA * (task_size / downlink_rate)
+    
+    # Energy 
+    energy = (mv.vehicle_transmit_power * PROCESSING_COMPLEXITY * task_size) / uplink_rate
+    
+    return (delay_uplink + delay_execution + delay_downlink, energy)
 
 
 class MissionVehicle:
@@ -180,10 +247,18 @@ class MissionVehicle:
         self.direction = true_positions[vehicle_id, 3]  # Moving direction (-1 or 1)
         self.cpu = random.uniform(*VEHICLE_CPU_RANGE)  # Random CPU frequency
         self.task_size = random.uniform(*TASK_SIZE_RANGE)  # Task size in MB
-        self.task_deadline=random.uniform(0.5,8)  
         self.remaining_task_size = self.task_size
         self.task_cycles = self.task_size * CPU_CYCLES_PER_MB  # Total CPU cycles required
         self.vehicle_transmit_power = 0.1  # Transmit power of vehicles in Watts
+        self.remaining_task_size = self.task_size  # NEW: Track remaining task
+        self.task_cycles = self.task_size * CPU_CYCLES_PER_MB
+        self.vehicle_transmit_power = 0.1
+    
+    #Split task into local and offloaded portions
+    def split_task(self, ratio):
+        offloaded_size = self.task_size * ratio
+        local_size = self.task_size - offloaded_size
+        return local_size, offloaded_size
 
     def __repr__(self):
         return (f"Vehicle-{self.vehicle_id}: Loc({self.x:.2f},{self.y:.2f}), "
@@ -205,7 +280,7 @@ class RoadsideUnit:
     
 # DQN Model
 class DDQNAgent:
-    def __init__(self, input_dim=10, action_dim=3):
+    def __init__(self, input_dim=10, action_dim=ACTION_SIZE):
         self.input_dim = input_dim
         self.action_dim = action_dim
         self.online_network = self.build_network()
@@ -306,119 +381,211 @@ ddqn= DDQNAgent(STATE_SIZE, ACTION_SIZE)
 
     
 def run_ddqn_simulation():
+    # Global metrics for full offloading
     global global_total_latency_local, global_total_latency_rsu, global_total_latency_v2v
     global global_total_energy_local, global_total_energy_rsu, global_total_energy_v2v
     global global_count_local, global_count_rsu, global_count_v2v
+    
+    # New global metrics for partial offloading components
+    global global_partial_local_latency, global_partial_local_energy
+    global global_partial_rsu_latency, global_partial_rsu_energy
+    global global_partial_v2v_latency, global_partial_v2v_energy
+    global global_partial_all_local_latency, global_partial_all_local_energy
+    global global_partial_all_rsu_latency, global_partial_all_rsu_energy
+    global global_partial_all_v2v_latency, global_partial_all_v2v_energy
+
+    ACTION_MEANINGS = {
+        0: "Local",
+        1: "RSU", 
+        2: "V2V",
+        3: "Local+RSU",
+        4: "Local+V2V",
+        5: "RSU+V2V",
+        6: "All"
+    }
+
+    # Initialize all global variables
+    global_total_latency_local = global_total_latency_rsu = global_total_latency_v2v = 0
+    global_total_energy_local = global_total_energy_rsu = global_total_energy_v2v = 0
+    global_count_local = global_count_rsu = global_count_v2v = 0
+    
+    # Initialize partial offloading metrics
+    global_partial_local_latency = global_partial_local_energy = 0
+    global_partial_rsu_latency = global_partial_rsu_energy = 0
+    global_partial_v2v_latency = global_partial_v2v_energy = 0
+    global_partial_all_local_latency = global_partial_all_local_energy = 0
+    global_partial_all_rsu_latency = global_partial_all_rsu_energy = 0
+    global_partial_all_v2v_latency = global_partial_all_v2v_energy = 0
 
     ddqn_episode_rewards = []
     for episode in range(EPISODES):
         total_reward = 0
         for mv in mission_vehicles:
+            # Initialize all metrics
+            local_delay = local_energy = 0
+            rsu_delay = rsu_energy = 0
+            v2v_delay = v2v_energy = 0
             
+            # Get available resources
             available_rsus = [r for r in rsus if abs(r.x - mv.x) <= COMMUNICATION_RANGE]
-            available_vehicles = [v for v in mission_vehicles if v.vehicle_id != mv.vehicle_id and abs(v.x - mv.x) <= COMMUNICATION_RANGE]
+            available_vehicles = [v for v in mission_vehicles 
+                               if v.vehicle_id != mv.vehicle_id 
+                               and abs(v.x - mv.x) <= COMMUNICATION_RANGE]
 
             state = [
-                    len(available_rsus),  # Number of RSUs in range
-                    len(available_vehicles),  # Number of vehicles in range
-                    mv.x, mv.y,  # Location
-                    mv.cpu,  # CPU frequency of vehicle
-                    mv.task_size,  # Remaining task size
-                    available_rsus[0].cpu if available_rsus else 0,  # CPU of selected RSU
-                    available_vehicles[0].cpu if available_vehicles else 0,  # CPU of selected vehicle
-                    mv.velocity,  # Speed of the vehicle
-                    mv.direction  # Moving direction
-                ]
+                mv.remaining_task_size / mv.task_size,
+                len(available_rsus),
+                len(available_vehicles),
+                mv.x, mv.y,
+                mv.cpu,
+                mv.task_size,
+                available_rsus[0].cpu if available_rsus else 0,
+                available_vehicles[0].cpu if available_vehicles else 0,
+                mv.velocity,
+                mv.direction
+            ]
 
             action = ddqn.act(state)
+            action_type = ACTION_MEANINGS[action]
 
+            selected_rsu = min(available_rsus, key=lambda r: abs(r.x - mv.x)) if available_rsus else None
+            selected_vehicle = select_best_vehicle_for_offloading(mv, available_vehicles) if available_vehicles else None
 
-            if action == 0:  # Local processing
-
-                local_delay = calculate_local_delay(mv.cpu,mv.task_size)
-                local_energy= calculate_local_energy(mv.cpu,mv.task_size)
-                
-                
-                
-                reward = compute_reward(local_delay, local_energy,mv.task_cycles)
+            if action_type == "Local":
+                local_delay = calculate_local_delay(mv.cpu, mv.task_size)
+                local_energy = calculate_local_energy(mv.cpu, mv.task_size)
+                total_delay = local_delay
+                total_energy = local_energy
                 ddqn_offloading_counts["Local"] += 1
-                global_total_latency_local += local_delay
-                global_total_energy_local += local_energy
                 global_count_local += 1
 
-
-            elif action == 1 and available_rsus:  # RSU Offloading
-                selected_rsu = min(rsus, key=lambda r: ((mv.x - r.x) ** 2 + (mv.y - r.y) ** 2) ** 0.5)
-                delay_edge=(PROCESSING_COMPLEXITY * mv.task_size ) / selected_rsu.cpu
-                distance=np.sqrt((mv.x - selected_rsu.x) ** 2 + (mv.y - selected_rsu.y) ** 2) 
-                delay_uplink=ALPHA*(mv.task_size/calculate_transmission_rate( mv.vehicle_transmit_power, distance))
-                delay_downlink=BETA*(mv.task_size/calculate_transmission_rate( selected_rsu.rsu_transmit_power, distance))
-               
-                rsu_delay = delay_edge + delay_uplink + delay_downlink
-                rsu_energy=(mv.vehicle_transmit_power*PROCESSING_COMPLEXITY*mv.task_size)/calculate_transmission_rate( mv.vehicle_transmit_power, distance)
-                reward = compute_reward(rsu_delay, rsu_energy,mv.task_cycles)
+            elif action_type == "RSU" and selected_rsu:
+                rsu_delay, rsu_energy = calculate_rsu_offload(mv, selected_rsu, mv.task_size)
+                total_delay = rsu_delay
+                total_energy = rsu_energy
                 ddqn_offloading_counts["RSU"] += 1
-                
-                global_total_latency_rsu += rsu_delay
-                global_total_energy_rsu += rsu_energy
                 global_count_rsu += 1
-            elif action==2 and available_vehicles :  # V2V Offloading
-                
-                
-                selected_vehicle = select_best_vehicle_for_offloading(mv, available_vehicles)
-                if selected_vehicle is None:
-                    local_delay = calculate_local_delay(mv.cpu,mv.task_size)
-                    local_energy= calculate_local_energy(mv.cpu,mv.task_size)
-                    reward = compute_reward(local_delay, local_energy,mv.task_cycles)
-                    ddqn_offloading_counts["Local"] += 1
-                    global_total_latency_local += local_delay
-                    global_total_energy_local += local_energy
-                    global_count_local += 1
-                    
-                else:
-                    distance = np.sqrt((mv.x - selected_vehicle.x) ** 2 + (mv.y - selected_vehicle.y) ** 2)
-                    delay_uplink = ALPHA*(mv.task_size / calculate_transmission_rate(mv.vehicle_transmit_power, distance))
-                    delay_execution = (PROCESSING_COMPLEXITY * mv.task_size) / selected_vehicle.cpu
-                    delay_downlink = BETA*(mv.task_size / calculate_transmission_rate(selected_vehicle.vehicle_transmit_power, distance))
-                    total_v2v_delay = delay_uplink + delay_execution + delay_downlink
-                    total_v2v_energy = (mv.vehicle_transmit_power * PROCESSING_COMPLEXITY * mv.task_size) /calculate_transmission_rate(mv.vehicle_transmit_power, distance)
 
-                    # Compute Reward
-                    reward = compute_reward(total_v2v_delay, total_v2v_energy,mv.task_cycles)
+            elif action_type == "V2V" and selected_vehicle:
+                v2v_delay, v2v_energy = calculate_v2v_offload(mv, selected_vehicle, mv.task_size)
+                total_delay = v2v_delay
+                total_energy = v2v_energy
+                ddqn_offloading_counts["V2V"] += 1
+                global_count_v2v += 1
 
-                    # Update global tracking variables
-                    ddqn_offloading_counts["V2V"] += 1
-                    global_total_latency_v2v += total_v2v_delay
-                    global_total_energy_v2v += total_v2v_energy
-                    global_count_v2v += 1   
-            else: 
-                local_delay = calculate_local_delay(mv.cpu,mv.task_size)
-                local_energy= calculate_local_energy(mv.cpu,mv.task_size)
+            elif action_type == "Local+RSU" and selected_rsu:
+                local_size, rsu_size = mv.split_task(0.5)
+                local_delay = calculate_local_delay(mv.cpu, local_size)
+                rsu_delay, rsu_energy = calculate_rsu_offload(mv, selected_rsu, rsu_size)
+                total_delay = local_delay + rsu_delay
+                total_energy = calculate_local_energy(mv.cpu, local_size) + rsu_energy
+                ddqn_offloading_counts["Local+RSU"] += 1
                 
+                # Track partial components separately
+                global_partial_local_latency += local_delay
+                global_partial_local_energy += calculate_local_energy(mv.cpu, local_size)
+                global_partial_rsu_latency += rsu_delay
+                global_partial_rsu_energy += rsu_energy
                 
-                reward = compute_reward(local_delay, local_energy,mv.task_cycles)
+                # Update effective counts
+                global_count_local += 0.5
+                global_count_rsu += 0.5
+
+            elif action_type == "Local+V2V" and selected_vehicle:
+                local_size, v2v_size = mv.split_task(0.5)
+                local_delay = calculate_local_delay(mv.cpu, local_size)
+                v2v_delay, v2v_energy = calculate_v2v_offload(mv, selected_vehicle, v2v_size)
+                total_delay = local_delay + v2v_delay
+                total_energy = calculate_local_energy(mv.cpu, local_size) + v2v_energy
+                ddqn_offloading_counts["Local+V2V"] += 1
+                
+                # Track partial components
+                global_partial_local_latency += local_delay
+                global_partial_local_energy += calculate_local_energy(mv.cpu, local_size)
+                global_partial_v2v_latency += v2v_delay
+                global_partial_v2v_energy += v2v_energy
+                
+                global_count_local += 0.5
+                global_count_v2v += 0.5
+
+            elif action_type == "RSU+V2V" and selected_rsu and selected_vehicle:
+                rsu_size, v2v_size = mv.split_task(0.5)
+                rsu_delay, rsu_energy = calculate_rsu_offload(mv, selected_rsu, rsu_size)
+                v2v_delay, v2v_energy = calculate_v2v_offload(mv, selected_vehicle, v2v_size)
+                total_delay = rsu_delay + v2v_delay
+                total_energy = rsu_energy + v2v_energy
+                ddqn_offloading_counts["RSU+V2V"] += 1
+                
+                # Track partial components
+                global_partial_rsu_latency += rsu_delay
+                global_partial_rsu_energy += rsu_energy
+                global_partial_v2v_latency += v2v_delay
+                global_partial_v2v_energy += v2v_energy
+                
+                global_count_rsu += 0.5
+                global_count_v2v += 0.5
+
+            elif action_type == "All" and selected_rsu and selected_vehicle:
+                local_size, offload_size = mv.split_task(0.33)
+                rsu_size = v2v_size = offload_size / 2
+                local_delay = calculate_local_delay(mv.cpu, local_size)
+                rsu_delay, rsu_energy = calculate_rsu_offload(mv, selected_rsu, rsu_size)
+                v2v_delay, v2v_energy = calculate_v2v_offload(mv, selected_vehicle, v2v_size)
+                total_delay = local_delay + rsu_delay + v2v_delay
+                total_energy = (calculate_local_energy(mv.cpu, local_size) + 
+                              rsu_energy + v2v_energy)
+                ddqn_offloading_counts["All"] += 1
+                
+                # Track all partial components
+                global_partial_all_local_latency += local_delay
+                global_partial_all_local_energy += calculate_local_energy(mv.cpu, local_size)
+                global_partial_all_rsu_latency += rsu_delay
+                global_partial_all_rsu_energy += rsu_energy
+                global_partial_all_v2v_latency += v2v_delay
+                global_partial_all_v2v_energy += v2v_energy
+                
+                global_count_local += 0.33
+                global_count_rsu += 0.33
+                global_count_v2v += 0.33
+
+            else:  # Fallback to local processing
+                local_delay = calculate_local_delay(mv.cpu, mv.task_size)
+                local_energy = calculate_local_energy(mv.cpu, mv.task_size)
+                total_delay = local_delay
+                total_energy = local_energy
                 ddqn_offloading_counts["Local"] += 1
-                global_total_latency_local += local_delay
-                global_total_energy_local += local_energy
                 global_count_local += 1
-                    
+
+            # Compute reward and update task
+            reward = compute_reward(total_delay, total_energy, mv.task_cycles)
+            mv.remaining_task_size = 0
             total_reward += reward
+
+            # Store experience
             next_state = state
             ddqn.store_experience(state, action, reward, next_state, done=False)
+
+            # Update global metrics (now safe due to initialization)
+            global_total_latency_local += local_delay
+            global_total_energy_local += local_energy
+            global_total_latency_rsu += rsu_delay
+            global_total_energy_rsu += rsu_energy
+            global_total_latency_v2v += v2v_delay
+            global_total_energy_v2v += v2v_energy
+
+        # Epsilon decay and training
         if ddqn.epsilon > EPSILON_MIN:
             ddqn.epsilon = max(ddqn.epsilon * EPSILON_DECAY, EPSILON_MIN)
-        ddqn_episode_rewards.append(total_reward)
         ddqn.train()
+        ddqn_episode_rewards.append(total_reward)
+
         if episode % 50 == 0:
-            print(f"DDQN Episode {episode} - Total Reward: {total_reward:.2f}")
+            print(f"Episode {episode}: Reward = {total_reward:.2f}")
+
     return ddqn, ddqn_episode_rewards
 
 
-
-
-# Set a unified theme for all plots
-sns.set_style("whitegrid")
-colors = ['#FFD700', '#87CEFA', '#32CD32']  # Gold, Light Blue, Light Green
+# Plotting Logic
 
 def plot_training_rewards(episode_rewards):
     plt.figure(figsize=(10, 6))
@@ -429,75 +596,175 @@ def plot_training_rewards(episode_rewards):
     plt.grid(True)
     plt.show()
 
+# Enhanced plotting functions for partial offloading analysis
 def plot_offloading_distribution(offloading_counts):
-    labels = list(offloading_counts.keys())
-    sizes = list(offloading_counts.values())
-    plt.figure(figsize=(8, 8))
-    plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=colors, textprops={'fontsize': 12})
-    plt.title("DDQN Offloading Decision Distribution", fontsize=14, fontweight='bold')
+    # Categorize decisions
+    categories = {
+        'Full Local': ['Local'],
+        'Full RSU': ['RSU'], 
+        'Full V2V': ['V2V'],
+        'Partial Local+RSU': ['Local+RSU'],
+        'Partial Local+V2V': ['Local+V2V'],
+        'Partial RSU+V2V': ['RSU+V2V'],
+        'Partial All': ['All']
+    }
+    
+    # Prepare data
+    labels = []
+    sizes = []
+    colors = []
+    color_palette = ['#FFD700', '#87CEFA', '#32CD32', '#FFA07A', '#98FB98', '#FF6347', '#9370DB']
+    
+    for i, (label, keys) in enumerate(categories.items()):
+        count = sum(offloading_counts.get(k, 0) for k in keys)
+        if count > 0:
+            labels.append(label)
+            sizes.append(count)
+            colors.append(color_palette[i])
+    
+    # Create figure
+    plt.figure(figsize=(12, 6))
+    
+    # Pie chart
+    plt.subplot(1, 2, 1)
+    plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%',
+            startangle=140, textprops={'fontsize': 10})
+    plt.title("Offloading Decision Distribution", fontsize=12)
+    
+    # Bar chart
+    plt.subplot(1, 2, 2)
+    plt.bar(labels, sizes, color=colors)
+    plt.title("Offloading Decision Counts", fontsize=12)
+    plt.xticks(rotation=45, ha='right')
+    plt.ylabel("Count")
+    
+    plt.tight_layout()
     plt.show()
 
 def plot_latency_distribution():
-    avg_latency_local = global_total_latency_local / global_count_local if global_count_local > 0 else 0
-    avg_latency_rsu = global_total_latency_rsu / global_count_rsu if global_count_rsu > 0 else 0
-    avg_latency_v2v = global_total_latency_v2v / global_count_v2v if global_count_v2v > 0 else 0
+    # Calculate effective counts (accounting for partial offloads)
+    effective_local = global_count_local + \
+                    ddqn_offloading_counts.get('Local+RSU', 0)*0.5 + \
+                    ddqn_offloading_counts.get('Local+V2V', 0)*0.5 + \
+                    ddqn_offloading_counts.get('All', 0)*0.33
     
-    plt.figure(figsize=(8, 6))
-    plt.bar(['Local', 'RSU', 'V2V'], [avg_latency_local, avg_latency_rsu, avg_latency_v2v], color=colors)
-    plt.title("DDQN Average Latency by Offloading Option", fontsize=14, fontweight='bold')
-    plt.ylabel("Latency (s)", fontsize=12)
+    effective_rsu = global_count_rsu + \
+                   ddqn_offloading_counts.get('Local+RSU', 0)*0.5 + \
+                   ddqn_offloading_counts.get('RSU+V2V', 0)*0.5 + \
+                   ddqn_offloading_counts.get('All', 0)*0.33
     
-    if global_count_local + global_count_rsu + global_count_v2v == 0:
-        plt.text(1, 0, "No Data Available", ha='center', fontsize=12, color='red')
+    effective_v2v = global_count_v2v + \
+                   ddqn_offloading_counts.get('Local+V2V', 0)*0.5 + \
+                   ddqn_offloading_counts.get('RSU+V2V', 0)*0.5 + \
+                   ddqn_offloading_counts.get('All', 0)*0.33
     
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    # Calculate weighted averages
+    avg_latency = {
+        'Local': global_total_latency_local/max(effective_local, 1),
+        'RSU': global_total_latency_rsu/max(effective_rsu, 1),
+        'V2V': global_total_latency_v2v/max(effective_v2v, 1)
+    }
+    
+    # Plot
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(avg_latency.keys(), avg_latency.values(), 
+                  color=['#FFD700', '#87CEFA', '#32CD32'])
+    
+    # Add value labels
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.2f}s',
+                ha='center', va='bottom')
+    
+    plt.title("Average Latency by Resource Type", fontsize=14)
+    plt.ylabel("Latency (seconds)")
+    plt.grid(axis='y', alpha=0.3)
     plt.show()
 
 def plot_energy_consumption():
-    avg_energy_local = global_total_energy_local / global_count_local if global_count_local > 0 else 0
-    avg_energy_rsu = global_total_energy_rsu / global_count_rsu if global_count_rsu > 0 else 0
-    avg_energy_v2v = global_total_energy_v2v / global_count_v2v if global_count_v2v > 0 else 0
+    # Calculate effective counts (same as latency)
+    effective_local = global_count_local + \
+                    ddqn_offloading_counts.get('Local+RSU', 0)*0.5 + \
+                    ddqn_offloading_counts.get('Local+V2V', 0)*0.5 + \
+                    ddqn_offloading_counts.get('All', 0)*0.33
     
-    plt.figure(figsize=(8, 6))
-    plt.bar(['Local', 'RSU', 'V2V'], [avg_energy_local, avg_energy_rsu, avg_energy_v2v], color=colors)
-    plt.title("DDQN Average Energy Consumption by Offloading Option", fontsize=14, fontweight='bold')
-    plt.ylabel("Energy (Joules)", fontsize=12)
+    effective_rsu = global_count_rsu + \
+                   ddqn_offloading_counts.get('Local+RSU', 0)*0.5 + \
+                   ddqn_offloading_counts.get('RSU+V2V', 0)*0.5 + \
+                   ddqn_offloading_counts.get('All', 0)*0.33
     
-    if global_count_local + global_count_rsu + global_count_v2v == 0:
-        plt.text(1, 0, "No Data Available", ha='center', fontsize=12, color='red')
+    effective_v2v = global_count_v2v + \
+                   ddqn_offloading_counts.get('Local+V2V', 0)*0.5 + \
+                   ddqn_offloading_counts.get('RSU+V2V', 0)*0.5 + \
+                   ddqn_offloading_counts.get('All', 0)*0.33
     
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.show()
-
-def plot_loss_curve():
+    # Calculate weighted averages
+    avg_energy = {
+        'Local': global_total_energy_local/max(effective_local, 1),
+        'RSU': global_total_energy_rsu/max(effective_rsu, 1),
+        'V2V': global_total_energy_v2v/max(effective_v2v, 1)
+    }
+    
+    # Plot
     plt.figure(figsize=(10, 6))
-    plt.plot(range(len(training_losses)), training_losses, marker='o', linestyle='-', color='crimson', linewidth=2)
-    plt.title("DDQN Training Loss Over Episodes", fontsize=14, fontweight='bold')
-    plt.xlabel("Episodes", fontsize=12)
-    plt.ylabel("Loss", fontsize=12)
-    plt.grid(True)
+    bars = plt.bar(avg_energy.keys(), avg_energy.values(),
+                  color=['#FFD700', '#87CEFA', '#32CD32'])
+    
+    # Add value labels
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.2f}J',
+                ha='center', va='bottom')
+    
+    plt.title("Average Energy Consumption by Resource Type", fontsize=14)
+    plt.ylabel("Energy (Joules)")
+    plt.grid(axis='y', alpha=0.3)
     plt.show()
 
-def plot_q_value_evolution():
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(len(q_value_history)), q_value_history, marker='o', linestyle='-', color='seagreen', linewidth=2)
-    plt.title("DDQN Q-Value Evolution Over Episodes", fontsize=14, fontweight='bold')
-    plt.xlabel("Episodes", fontsize=12)
-    plt.ylabel("Max Q-Value", fontsize=12)
-    plt.grid(True)
-    plt.show()
+def plot_partial_offloading_analysis():
+    # Extract partial offloading data
+    partial_data = {
+        'Local+RSU': ddqn_offloading_counts.get('Local+RSU', 0),
+        'Local+V2V': ddqn_offloading_counts.get('Local+V2V', 0),
+        'RSU+V2V': ddqn_offloading_counts.get('RSU+V2V', 0),
+        'All': ddqn_offloading_counts.get('All', 0)
+    }
+    
+    # Only plot if there's data
+    if sum(partial_data.values()) > 0:
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(partial_data.keys(), partial_data.values(),
+                      color=['#FFA07A', '#98FB98', '#FF6347', '#9370DB'])
+        
+        plt.title("Partial Offloading Strategy Distribution", fontsize=14)
+        plt.ylabel("Count")
+        
+        # Add value labels
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height}',
+                    ha='center', va='bottom')
+        
+        plt.grid(axis='y', alpha=0.3)
+        plt.show()
 
-# Run DDQN simulation and plot results
+# Run simulation and plot results
 ddqn_agent, ddqn_episode_rewards = run_ddqn_simulation()
 
-print(f"Local Offloads: {global_count_local}")
-print(f"RSU Offloads: {global_count_rsu}")
-print(f"V2V Offloads: {global_count_v2v}")
+# Print effective counts (accounting for partial offloads)
+print("\n=== Effective Task Distribution ===")
+print(f"Local: {global_count_local + ddqn_offloading_counts.get('Local+RSU',0)*0.5 + ddqn_offloading_counts.get('Local+V2V',0)*0.5 + ddqn_offloading_counts.get('All',0)*0.33:.1f} tasks")
+print(f"RSU: {global_count_rsu + ddqn_offloading_counts.get('Local+RSU',0)*0.5 + ddqn_offloading_counts.get('RSU+V2V',0)*0.5 + ddqn_offloading_counts.get('All',0)*0.33:.1f} tasks")
+print(f"V2V: {global_count_v2v + ddqn_offloading_counts.get('Local+V2V',0)*0.5 + ddqn_offloading_counts.get('RSU+V2V',0)*0.5 + ddqn_offloading_counts.get('All',0)*0.33:.1f} tasks")
 
+# Generate all plots
 plot_training_rewards(ddqn_episode_rewards)
 plot_offloading_distribution(ddqn_offloading_counts)
 plot_latency_distribution()
 plot_energy_consumption()
-# plot_loss_curve()
-# plot_q_value_evolution()
+plot_partial_offloading_analysis()
+
 
